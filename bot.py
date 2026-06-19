@@ -1,7 +1,10 @@
 import json
 import logging
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from openai import AsyncOpenAI
 
 # تنظیمات لاگ برای عیب‌یابی
@@ -19,8 +22,7 @@ ai_client = AsyncOpenAI(
     base_url=config['AI_BASE_URL']
 )
 
-# حافظه موقت برای ذخیره پیام‌های گروه (برای بازسازی زنجیره ریپلای)
-# کلید: message_id, مقدار: متن پیام و فرستنده
+# حافظه موقت برای ذخیره پیام‌های گروه
 message_history = {}
 
 # تعریف دقیق شخصیت حمید هدشی
@@ -37,36 +39,17 @@ SYSTEM_PROMPT = """
 دستورالعمل رفتار:
 - خیلی صمیمی، رفیقانه و شوخ‌طبع باشید. اصطلاحات حسابداری را گاهی چاشنی شوخی‌هایتان کنید.
 - فقط و فقط پاسخ متن را بفرستید. هیچ پیش‌گفتار، پس‌گفتار یا توضیحی اضافه مثل "پاسخ:" یا "حمید:" بنویسید.
-- پاسخ‌ها کوتاه، خلاصه و متناسب با چت‌های تلگرامی باشد (طومار ننویسید، مگر اینکه موضوع نیاز به کل‌کل یا توضیح باحال داشته باشد).
+- پاسخ‌ها کوتاه، خلاصه و متناسب با چت‌های تلگرامی باشد.
 - اگر به تاریخچه پیام‌های قبلی نگاه می‌کنی، جوری جواب بده که انگار کاملاً در جریان بحث بوده‌ای.
 """
 
 def save_to_history(chat_id, message_id, text, user_name):
-    """ذخیره پیام‌ها در حافظه برای استفاده در ریپلای‌های بعدی"""
     if chat_id not in message_history:
         message_history[chat_id] = {}
-    
-    # ذخیره متن پیام به همراه نام فرستنده
     message_history[chat_id][message_id] = f"{user_name}: {text}"
-    
-    # محدود کردن حجم حافظه هر گروه برای جلوگیری از مصرف بیش از حد رم (مثلاً ۱۰۰ پیام آخر)
     if len(message_history[chat_id]) > 100:
         first_key = next(iter(message_history[chat_id]))
         del message_history[chat_id][first_key]
-
-def build_reply_chain(chat_id, current_reply_to_id):
-    """بازسازی زنجیره ریپلای‌ها برای فهمیدن موضوع بحث"""
-    chain = []
-    current_id = current_reply_to_id
-    
-    # تا جایی که پیام قبلی در حافظه موجود باشد، زنجیره را دنبال می‌کند
-    while current_id and chat_id in message_history and current_id in message_history[chat_id]:
-        chain.insert(0, message_history[chat_id][current_id])
-        # در این ساختار ساده، فقط پیام مستقیم قبلی را می‌آوریم، 
-        # اگر می‌خواهید زنجیره‌های طولانی‌تر داشته باشید باید شناسه ریپلایِ پیامِ قبلی را هم ذخیره کنید.
-        break 
-    
-    return chain
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -78,10 +61,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_name = user.first_name if user else "کاربر"
 
-    # ۱. ذخیره پیام جاری در حافظه گروه
     save_to_history(chat_id, message_id, text, user_name)
 
-    # ۲. بررسی اینکه آیا ربات باید پاسخ دهد یا خیر؟
     is_reply_to_bot = False
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
         if update.message.reply_to_message.from_user.username == config['BOT_USERNAME']:
@@ -89,56 +70,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_mentioned = f"@{config['BOT_USERNAME']}" in text
 
-    # اگر تگ شده بود یا ریپلای شده بود، پردازش شروع می‌شود
     if is_mentioned or is_reply_to_bot:
-        # حذف منشن از متن برای ارسال تمیزتر به هوش مصنوعی
         clean_text = text.replace(f"@{config['BOT_USERNAME']}", "").strip()
-        
-        # ساخت پیام‌های ورودی برای مدل
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         
-        # بررسی وجود ریپلای و بازسازی بافتار بحث
         if update.message.reply_to_message:
             reply_id = update.message.reply_to_message.message_id
             reply_text = update.message.reply_to_message.text
             reply_user = update.message.reply_to_message.from_user.first_name if update.message.reply_to_message.from_user else "کاربر"
-            
-            # اضافه کردن پیام قبلی که ریپلای شده به عنوان کانتکست
             messages.append({"role": "user", "content": f"پیام قبلی در گروه از {reply_user}: {reply_text}"})
-            messages.append({"role": "assistant", "content": "متوجه شدم. حالا منتظر پاسخ یا واکنش بعدی هستم."})
+            messages.append({"role": "assistant", "content": "متوجه شدم."})
 
-        # اضافه کردن پیام فعلی کاربر
         messages.append({"role": "user", "content": f"{user_name}: {clean_text}"})
 
         try:
-            # ارسال درخواست به API هوش مصنوعی
             response = await ai_client.chat.completions.create(
                 model=config['AI_MODEL'],
                 messages=messages,
-                temperature=0.85 # دمای بالاتر برای خلاق‌تر و فان‌تر شدن لحن
+                temperature=0.85
             )
-            
             bot_response = response.choices[0].message.content.strip()
-            
-            # ارسال پاسخ به صورت ریپلای روی پیام کاربر
             bot_msg = await update.message.reply_text(bot_response)
-            
-            # ذخیره پاسخ خود ربات در حافظه
             save_to_history(chat_id, bot_msg.message_id, bot_response, "حمید هدشی")
-
         except Exception as e:
             logging.error(f"Error in AI Service: {e}")
-            # پاسخ فان در صورت بروز خطا بدون لو دادن ماهیت فنی
             await update.message.reply_text("آقا این ماشین حساب ما قاطی کرده، یه لحظه فیوزام پرید! دوباره بگو.")
 
+# --- بخش وب‌سرور فیک برای رندر ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running alive!")
+
+def run_health_server():
+    # رندر پورت را به صورت اتوماتیک در این متغیر محیطی قرار می‌دهد، اگر نبود روی 8080 می‌رود
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"Health check server started on port {port}")
+    server.serve_forever()
+
 def main():
+    # روشن کردن وب‌سرور در یک ترید جداگانه تا مانع کار ربات تلگرام نشود
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     """راه‌اندازی ربات تلگرام"""
     app = Application.builder().token(config['TELEGRAM_BOT_TOKEN']).build()
-
-    # مدیریت تمام پیام‌های متنی در گروه‌ها و چت‌های شخصی
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("ربات آقا حمید هدشی روشن شد و آماده تراز کردنه...")
+    print("ربات آقا حمید هدشی با سرور هلث‌چک روشن شد...")
     app.run_polling()
 
 if __name__ == '__main__':
