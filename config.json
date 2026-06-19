@@ -1,0 +1,7 @@
+{
+    "TELEGRAM_BOT_TOKEN": "8739513325:AAHsC60fVjloqta94WI4b4q0q322DhzLUHQ",
+    "AI_API_KEY": "csk_dkrev4n54c9v2x56vwwd3h94w69wkxdnvv5knrwhhvp5968e",
+    "AI_BASE_URL": "https://api.cerebras.ai/v1",
+    "AI_MODEL": "gpt-oss-120b",
+    "BOT_USERNAME": "Acchdshybot"
+}
